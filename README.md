@@ -29,24 +29,20 @@
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/yourusername/ReconKit.git
-cd ReconKit
+git clone https://github.com/AxelDaTechwhizz/reconkit.git
+cd reconkit
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-## to install globally:
-
-pip install . 
 
 ## After first install run:
 
 reconkit update-cves
 
 
-## Usage
+# Example usage:
 
-python reconkit.py --target example.com [OPTIONS]
-
-python reconkit.py --target example.com --subdomains --fingerprint --cves
+python reconkit.py [flags] subenum --domain example.com
+python reconkit.py [flags] dirscan --url https://example.com
 
 ## Available flags
 
