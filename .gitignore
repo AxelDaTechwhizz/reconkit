@@ -1,0 +1,51 @@
+# Bytecode and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Logs and runtime files
+*.log
+*.pid
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor/project files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Results and outputs
+Results/
+output/
+*.out
+
+# CVE data and DB
+cves.db
+cves_jsons/
+
+# Dist and build
+build/
+dist/
+*.egg-info/
+
+# Local installs
+.eggs/
+.installed.cfg
+*.egg
+*.whl
+
+# PyInstaller or package artifacts
+*.spec
+
+# Pipenv or poetry
+Pipfile.lock
+poetry.lock
