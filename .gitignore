@@ -49,3 +49,4 @@ dist/
 # Pipenv or poetry
 Pipfile.lock
 poetry.lock
+git-feature.sh
