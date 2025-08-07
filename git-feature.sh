@@ -1,52 +1,47 @@
 #!/bin/bash
 
-FEATURE_NAME=$1
-COMMIT_MSG=$2
-NEW_VERSION=$3  # e.g., 2.1.0
+FEATURE_NAME="$1"
+COMMIT_MSG="$2"
+VERSION="$3"
 
 if [ -z "$FEATURE_NAME" ] || [ -z "$COMMIT_MSG" ]; then
-  echo "Usage: ./git-feature.sh <feature-name> <commit-message> [new-version]"
-  echo "Example: ./git-feature.sh traffic-interception 'Add traffic interception' 2.1.0"
+  echo "Usage: ./git-feature.sh <feature-name> \"<commit-message>\" [version]"
   exit 1
 fi
 
-# Step 1: Update main branch
-git checkout main && git pull origin main
+FEATURE_BRANCH="feature/$FEATURE_NAME"
 
-# Step 2: Create and switch to feature branch
-git checkout -b feature/$FEATURE_NAME
+# Ensure we're on main and up to date
+git checkout main || exit 1
+git pull origin main || exit 1
 
-# Step 3: Add and commit changes
+# Create or switch to feature branch
+if git show-ref --verify --quiet refs/heads/"$FEATURE_BRANCH"; then
+  echo "🔄 Switching to existing branch: $FEATURE_BRANCH"
+  git checkout "$FEATURE_BRANCH"
+else
+  echo "🌱 Creating new branch: $FEATURE_BRANCH"
+  git checkout -b "$FEATURE_BRANCH"
+fi
+
+# Stage, commit, and push
 git add .
 git commit -m "$COMMIT_MSG"
+git push -u origin "$FEATURE_BRANCH"
 
-# Step 4: Push branch to origin
-git push -u origin feature/$FEATURE_NAME
-
-# Step 5: Open a PR using GitHub CLI
-echo "Opening PR..."
-gh pr create --fill --title "Feature: $FEATURE_NAME" --body "$COMMIT_MSG"
-
-# Step 6: If new version specified, tag and push tag (run only after PR is merged)
-if [ ! -z "$NEW_VERSION" ]; then
-  echo "Tagging new version: v$NEW_VERSION"
-
-  # Make sure you are on main and up to date before tagging
-  git checkout main
-  git pull origin main
-
-  # Create annotated tag
-  git tag -a "v$NEW_VERSION" -m "Release version $NEW_VERSION - $FEATURE_NAME"
-
-  # Push tag
-  git push origin "v$NEW_VERSION"
-
-  # Step 7: Deploy (add your deploy commands here)
-  echo "Running deployment steps..."
-  # Example: ./deploy.sh or ssh user@server 'deploy commands'
-  # ./deploy.sh
-
-  echo "Deployment finished."
+# Open PR using GitHub CLI
+if command -v gh >/dev/null 2>&1; then
+  gh pr create --base main --head "$FEATURE_BRANCH" --title "$COMMIT_MSG" --body "$COMMIT_MSG"
 else
-  echo "No version specified, skipping tagging and deployment."
+  echo "⚠️ GitHub CLI not installed or not authenticated. PR not created."
+fi
+
+# Optional tagging and deployment
+if [ -n "$VERSION" ]; then
+  echo "🏷️ Tagging version v$VERSION"
+  git tag "v$VERSION"
+  git push origin "v$VERSION"
+  echo "🚀 Deployment/tagging done for v$VERSION"
+else
+  echo "ℹ️ No version specified, skipping tagging and deployment."
 fi
