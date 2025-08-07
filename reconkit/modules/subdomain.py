@@ -1,6 +1,9 @@
 import re
 import sys
 import os
+import requests
+import ipaddress
+from urllib.parse import urljoin, urlparse
 import reconkit.modules.utils
 from tqdm import tqdm
 from urllib.parse import urljoin
@@ -11,9 +14,9 @@ from typing import Dict, List, Set, Optional
 
 
 
-
-def subdomain_finder(domain: str, max_workers: int,
-                     headers : dict,throttle : float,
+def subdomain_finder(domain: str, max_workers: int,timeout: int, verify_ssl: bool,
+                     headers : dict,throttle : float,filename : str,
+                     allow_redirects: bool = True,
                      save_file: bool = False, file_format: str = 'txt',
                      recursive: bool = False, max_depth: int = 1,
                      _depth: int = 0, _visited: Optional[Set[str]] = None) -> Dict:
@@ -72,16 +75,18 @@ def subdomain_finder(domain: str, max_workers: int,
         'webarchive_robots': lambda t: set(re.findall(rf'https?://([\w\.-]*\.{re.escape(domain)})', t)),
         'dnsdumpster': lambda t: parse_html_list(t, rf'[\w\.-]+\.{re.escape(domain)}'),
         'rapiddns': lambda t: parse_html_list(t, rf'[\w\.-]+\.{re.escape(domain)}'),
-        'omnisint': lambda t: set(json_loads(t)),
-        'jldc': lambda t: set(json_loads(t)),
-        'gau': lambda t: set(json_loads(t))
+        'omnisint': lambda d: set(d),
+        'jldc': lambda d: set(d),
+        'gau': lambda d: set(d)
+
     }
 
     results = set()
     failures = {}
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(reconkit.modules.utils.fetch_with_retry,headers, url): src for src, url in sources.items()}
+        futures = {executor.submit(reconkit.modules.utils.fetch_with_retry, url, headers, timeout, verify_ssl,
+                  allow_redirects, throttle): src for src, url in sources.items()}
         futures_iter = tqdm(as_completed(futures), total=len(futures), desc=f"Scanning {domain}", unit="src") \
     if sys.stdout.isatty() else as_completed(futures)
         
@@ -93,8 +98,9 @@ def subdomain_finder(domain: str, max_workers: int,
             try:
                 resp = future.result()
 
-                if not resp or not resp.ok:
-                    raise Exception(f"Failed to fetch {src}: {resp.status_code if resp else 'No Response'}")
+                if not isinstance(resp, requests.Response) or not resp.ok:
+                    raise Exception(f"Failed to fetch {src}: {getattr(resp, 'status_code', 'No Response')}")
+
                 
                 if src in text_sources:
                     try:
@@ -124,10 +130,6 @@ def subdomain_finder(domain: str, max_workers: int,
                 failures[src] = str(e)
                 reconkit.modules.utils.print_error(f"{src} error: {e}")
                 
-                
-    
-
-
 
     recursive_results = set()
 
@@ -160,9 +162,9 @@ def subdomain_finder(domain: str, max_workers: int,
 
     final_results = results.union(recursive_results)
 
-    if save_file and _depth == 0:  # Save only at top level call
-            filename = f"{domain}_subdomains.{file_format}"
-            reconkit.modules.utils.save_to_file(filename, sorted(final_results))
+    if save_file and not filename:
+        filename = f"{domain}_subdomains.{file_format}"
+    reconkit.modules.utils.save_to_file(filename, sorted(final_results))
 
     return {
         'domain': domain,
@@ -173,7 +175,8 @@ def subdomain_finder(domain: str, max_workers: int,
 
 def subdomain_from_file(filename: str, max_workers: int, save_file: bool,
                         headers : dict, rmin_throttle : float,recursive: bool , max_depth: int,
-                        rmax_throttle : float,file_format: str = 'txt') -> Dict[str, List[str]]:
+                        rmax_throttle : float,output : str,
+                        file_format: str = 'txt') -> Dict[str, List[str]]:
     """
     Reads a file containing domains and finds subdomains for each domain using multiple sources.
     :param filename: Path to the input file containing domains
@@ -183,7 +186,7 @@ def subdomain_from_file(filename: str, max_workers: int, save_file: bool,
     :return: Dictionary with domains as keys and lists of subdomains as values
     """
     try:
-        reconkit.modules.utils.validate_input_file(filename)
+        filename = reconkit.modules.utils.validate_input_file(filename)
     except Exception as e:
         reconkit.modules.utils.print_error(f"An error occurred: {e}") 
         return {}
@@ -220,9 +223,10 @@ def subdomain_from_file(filename: str, max_workers: int, save_file: bool,
                 reconkit.modules.utils.log_to_file(f"Error processing domain {domain}: {e}", 'error')
 
     if save_file:
-        base = os.path.basename(os.path.splitext(filename)[0])
-        filename = f"results_{base.lower()}.{file_format.lstrip('.')}"
-        reconkit.modules.utils.save_to_file(filename, results)
+        if not output or output == "":
+            base = os.path.basename(os.path.splitext(filename)[0])
+            output = f"results_{base.lower()}.{file_format.lstrip('.')}"
+        reconkit.modules.utils.save_to_file(output, results)
 
     return results
 
@@ -232,84 +236,137 @@ Function to generate a custom subdomain wordlist based on a domain
 This function will create a wordlist based on the domain name, which can be used for subdomain enumeration.
 """
 
-
 def generate_custom_wordlist(domain: str,
-                              wordlist_path: Optional[str] = None,
-                              headers : dict = None,save_file: bool = False,
-                              filename: Optional[str] = None,
-                              file_format:str='txt') -> Set[str]:
+                             timeout: int,
+                             verify_ssl: bool,
+                             throttle: float,
+                             allow_redirects: bool = True,
+                             wordlist_path: Optional[str] = None,
+                             headers: dict = None,
+                             save_file: bool = False,
+                             filename: Optional[str] = None,
+                             file_format: str = None,
+                             mode: str = None) -> Set[str]:
     """
-    Generates a custom subdomain wordlist based on scraping a target domain and optional wordlist file.
+    Generates a custom wordlist based on scraping a target domain.
 
-    :param domain: Target domain (e.g., example.com)
-    :param wordlist_path: Path to wordlist file (one word per line)
+    :param domain: Target domain (e.g., http://localhost:3000)
+    :param timeout: Request timeout
+    :param verify_ssl: Whether to verify SSL certs
+    :param throttle: Delay between requests
+    :param allow_redirects: Allow HTTP redirects
+    :param wordlist_path: Optional wordlist to build from
+    :param headers: Optional HTTP headers
     :param save_file: Save result to file
-    :param filename: Optional output filename
-    :return: Set of discovered subdomains
+    :param filename: Output filename
+    :param file_format: txt, json, etc.
+    :param mode: 'subdomain' or 'content'
+    :return: Set of extracted words or subdomains
     """
-    if not reconkit.modules.utils.is_valid_domain(domain):
+    parsed = urlparse(domain)
+    host = parsed.hostname or domain
+    scheme = parsed.scheme or "http"
+    netloc = parsed.netloc or host
+
+    mode = (mode or 'subdomain').lower()
+    file_format = file_format or 'txt'
+
+    if mode not in {'subdomain', 'content'}:
+        raise ValueError("Mode must be either 'subdomain' or 'content'")
+
+    def is_valid_target(hostname: str) -> bool:
+        if hostname == "localhost":
+            return True
+        try:
+            ipaddress.ip_address(hostname)
+            return True
+        except ValueError:
+            return reconkit.modules.utils.is_valid_domain(hostname)
+
+    if not is_valid_target(host):
         raise ValueError(f"Invalid domain format: {domain}")
 
-    base_url = f"https://{domain}"
+    base_url = f"{scheme}://{netloc}"
+
     subdomains = set()
+    keywords = set()
 
     def extract_subdomains(text: str) -> Set[str]:
-        pattern = rf"\b((?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)})\b"
+        pattern = rf"\b((?:[a-zA-Z0-9_-]+\.)+{re.escape(host)})\b"
         found = set(re.findall(pattern, text, re.IGNORECASE))
-        return {s.lower().strip('.') for s in found if s.lower() != domain}
+        return {s.lower().strip('.') for s in found if s.lower() != host}
+
+    def extract_keywords(text: str) -> Set[str]:
+        stopwords = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'have', 'your'}
+        tokens = set(re.findall(r'\b[a-zA-Z0-9_-]{4,}\b', text))
+        return {t.lower() for t in tokens if t.lower() not in stopwords}
 
     def fetch_content(url: str) -> str:
-        response = reconkit.modules.utils.fetch_url(url,headers=headers)
+        response = reconkit.modules.utils.fetch_with_retry(
+            url, timeout=timeout, verify_ssl=verify_ssl,
+            allow_redirects=allow_redirects, headers=headers, throttle=throttle
+        )
         if response and response.ok:
             return response.text
         return ""
 
-    # 1. Main page
+    target_urls = [
+        ("Main HTML", base_url),
+        ("robots.txt", urljoin(base_url, "/robots.txt")),
+        ("sitemap.xml", urljoin(base_url, "/sitemap.xml"))
+    ]
+
+    with tqdm(total=len(target_urls), desc="Fetching core pages", unit="page") as pbar:
+        for label, url in target_urls:
+            content = fetch_content(url)
+            if mode == 'subdomain':
+                subdomains.update(extract_subdomains(content))
+            else:
+                keywords.update(extract_keywords(content))
+            pbar.update(1)
+
+    # JavaScript files
     html = fetch_content(base_url)
-    subdomains.update(extract_subdomains(html))
-
-    # 2. robots.txt
-    robots_txt = fetch_content(urljoin(base_url, "/robots.txt"))
-    subdomains.update(extract_subdomains(robots_txt))
-
-    # 3. sitemap.xml
-    sitemap_xml = fetch_content(urljoin(base_url, "/sitemap.xml"))
-    subdomains.update(extract_subdomains(sitemap_xml))
-
-    # 4. JS files
     soup = BeautifulSoup(html, 'html.parser')
     script_tags = soup.find_all('script', src=True)
-    js_urls = {
-        urljoin(base_url, tag['src'])
-        for tag in script_tags if tag['src'].endswith('.js')
-    }
+    js_urls = {urljoin(base_url, tag['src']) for tag in script_tags if tag['src'].endswith('.js')}
 
-    for js_url in js_urls:
-        js_code = fetch_content(js_url)
-        subdomains.update(extract_subdomains(js_code))
+    if not js_urls:
+        tqdm.write("No JavaScript files found.")
 
-    # 5. Load words from file and build subdomains
-    if wordlist_path:
+    with tqdm(total=len(js_urls), desc="Processing JS files", unit="file") as pbar:
+        for js_url in js_urls:
+            js_code = fetch_content(js_url)
+            if mode == 'subdomain':
+                subdomains.update(extract_subdomains(js_code))
+            else:
+                keywords.update(extract_keywords(js_code))
+            pbar.update(1)
+
+    # Add subdomains from wordlist file
+    if mode == 'subdomain' and wordlist_path:
         try:
-            reconkit.modules.utils.validate_input_file(wordlist_path)
+            wordlist_path = reconkit.modules.utils.validate_input_file(wordlist_path)
             with open(wordlist_path, 'r', encoding='utf-8') as f:
-                for line in f:
+                for line in tqdm(f, desc="Processing wordlist", unit="word"):
                     word = line.strip().lower()
                     if word:
-                        subdomains.add(f"{word}.{domain}")
+                        subdomains.add(f"{word}.{host}")
         except Exception as e:
             reconkit.modules.utils.print_error(f"Failed to load wordlist from {wordlist_path}: {e}")
 
-    # 6. Save results
-    try:
-        if save_file:
-            if not filename:
-                filename = f"{domain}_custom_wordlist.{file_format}"
-            reconkit.modules.utils.save_to_file(filename, sorted(subdomains))
-    except Exception as e:
-        reconkit.modules.utils.print_error(f"An error occured as: {e}")  
+    result = subdomains if mode == 'subdomain' else keywords
 
-    return subdomains
+    # Save to file
+    if save_file:
+        try:
+            if not filename:
+                filename = f"{host}_custom_wordlist.{file_format}"
+            reconkit.modules.utils.save_to_file(filename, sorted(result))
+        except Exception as e:
+            reconkit.modules.utils.print_error(f"An error occurred while saving: {e}")
+
+    return result
 
 
     

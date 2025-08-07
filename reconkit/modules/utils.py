@@ -10,7 +10,7 @@ import re
 import traceback
 from random import uniform
 from time import sleep
-from typing import Any
+from typing import Any,Optional
 from urllib.parse import urlparse
 from colorama import Fore,init,Style
 
@@ -60,56 +60,63 @@ Functions to fetch URLs and handle errors
 # Disable SSL warnings
 requests.packages.urllib3.disable_warnings()
 
-def fetch_url(url : str, headers : bool,timeout : int,
-               verify_ssl : bool, allow_redirects : bool = True):
-
+def fetch_url(url: str, headers: Optional[dict], timeout: int,
+              verify_ssl: bool, allow_redirects: bool = True):
     """
-    The function fetches the given url with optional headers and ssl verification
+    Fetches the given URL with optional headers and SSL verification.
 
-    :param url: The full url to request (http/https)
-
+    :param url: The full URL to request (http/https)
     :param headers: Optional headers dict
-
-    :param timeout: Timeout in secs (default = 5)
-
-    :param verify_ssl: verify ssl certificates (default = False)
+    :param timeout: Timeout in seconds
+    :param verify_ssl: Whether to verify SSL certificates
     """
     try:
-        response = requests.get(url, headers=headers,timeout=timeout,allow_redirects=allow_redirects,verify=verify_ssl)
+        response = requests.get(url, headers=headers, timeout=timeout,
+                                allow_redirects=allow_redirects, verify=verify_ssl)
         return response
     except requests.exceptions.Timeout:
-        print_warning(f'Request timed out: {url}')
+        print_warning(f'[!⏰] Request timed out: {url}')
+        raise
     except requests.ConnectionError:
-        print_warning(f'Connection error: {url}')
+        print_warning(f"[/('_')\\] Connection error: {url}")
+        raise
     except requests.RequestException as e:
-        print_warning(f'Request failed: {url} | {e}')
-    
-    return None
+        print_warning(f"[x_x] Request failed: {url} | {e}")
+        raise
 
 
 
-def fetch_with_retry(url: str,headers: dict ,timeout: int, verify_ssl: bool ,
-                      allow_redirects : bool,throttle : float,retries: int = 3):
-    
-    """Fetch a URL with retry and exponential backoff. Returns response regardless of status code."""
+from time import sleep
+from random import uniform
+
+def fetch_with_retry(url: str, headers: dict, timeout: int, verify_ssl: bool,
+                     allow_redirects: bool, throttle: float, retries: int = 3):
+    """Fetch a URL with retry and exponential backoff. Returns response or None."""
     throttle = AdaptiveThrottle(throttle)
+    default_wait_time = 10
 
     for attempt in range(retries):
         try:
             throttle.wait()
             response = fetch_url(url, headers=headers, timeout=timeout,
-                             allow_redirects=allow_redirects, verify_ssl=verify_ssl)
+                                 allow_redirects=allow_redirects, verify_ssl=verify_ssl)
+
             if response.status_code in [429, 503]:
                 retry_after = response.headers.get("Retry-After")
-                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 10
+                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else default_wait_time
                 throttle.failure()
             else:
                 throttle.success()
                 return response
+
         except Exception as e:
             print_error(f"Fetch failed: {e}")
+            wait_time = default_wait_time
+
         sleep(wait_time ** attempt + uniform(0, 1))
-    raise Exception(f"Failed to fetch {url} after {retries} retries.")
+
+    return None  # ✅ Don't raise — let caller handle it
+
 
 
 """
@@ -140,13 +147,10 @@ class AdaptiveThrottle:
     
     def wait(self):
         adaptive_wait = self.base_wait * self.multiplier
-        print_info(f"[Throttle] Sleeping for {adaptive_wait:.2f} seconds...")
         time.sleep(adaptive_wait)
     
     def success(self):
         """Call this when a request succeeds to reset multiplier."""
-        if self.failures > 0:
-            print_success("[Throttle] Success detected, resetting backoff.")
         self.failures = 0
         self.multiplier = 1.0
     
@@ -173,29 +177,58 @@ def random_throttle(min_delay : float, max_delay:float):
 Function to validate input file
 """
 
-def validate_input_file(filename: str):
+def validate_input_file(filename: str) -> str:
+    """
+    Validates a file path. If it's an absolute path and exists, returns it.
+    Otherwise, searches upward from the current directory, recursively through subdirectories,
+    until the file is found.
 
-    if not filename:
-        raise ValueError("Filename cannot be empty")
-    
-    if not os.path.isfile(filename):
-        raise FileNotFoundError(f"File not found: {filename}")
-        
-    return True
+    :param filename: Path or name of the file
+    :return: Absolute path to the located file
+    :raises FileNotFoundError: If the file is not found
+    """
+
+    # Absolute path provided
+    if os.path.isabs(filename):
+        if os.path.isfile(filename):
+            return os.path.abspath(filename)
+        else:
+            raise FileNotFoundError(f"File not found: {filename}")
+
+    # Relative name – search upward recursively
+    visited = set()
+    current_dir = os.getcwd()
+
+    while True:
+        if current_dir in visited:
+            break
+        visited.add(current_dir)
+
+        for root, _, files in os.walk(current_dir):
+            if filename in files:
+                return os.path.abspath(os.path.join(root, filename))
+
+        parent = os.path.dirname(current_dir)
+        if parent == current_dir:
+            break
+        current_dir = parent
+
+    raise FileNotFoundError(f"File not found: {filename}")
+
    
 
 """
 Function to save data to a file
 """
-
 def save_to_file(filename: str, data: Any):
     """
     Saves data to a file in .json, .csv, or .txt format based on extension.
     Smart formatting for different data types.
     """
+
     ext = os.path.splitext(filename)[1].lower().lstrip('.')
     valid_formats = {'json', 'csv', 'txt'}
-    
+
     if not ext:
         filename += ".txt"
         ext = 'txt'
@@ -203,10 +236,18 @@ def save_to_file(filename: str, data: Any):
     if ext not in valid_formats:
         print_error(f"Unsupported file extension: .{ext}")
         return
-    
-    os.makedirs("Results", exist_ok=True)
-    filename = os.path.join("Results", os.path.basename(filename))
 
+    # Normalize path
+    filename = filename.lstrip("/\\")
+    if filename.startswith("Results/") or filename.startswith("Results\\"):
+        filename = filename.split(os.sep, 1)[-1]
+
+    os.makedirs("Results", exist_ok=True)
+    filename = os.path.join("Results", filename)
+
+    # Pre-process sets for JSON
+    if isinstance(data, set):
+        data = list(data)
 
     try:
         with open(filename, 'w', encoding='utf-8', newline='') as file:
@@ -359,23 +400,24 @@ validate_domain function to check if a string is a valid domain name
 
 import ipaddress
 
+
 def is_valid_domain(domain: str) -> bool:
     """
-    Validates if the input is a proper domain name (not an IP address).
-    Accepts subdomains and internationalized domain names (IDNs).
-    
-    Rules:
-    - Total length ≤ 253
-    - Each label ≤ 63 characters
-    - Only alphanumeric characters and hyphens (no leading/trailing hyphens)
-    - No spaces or invalid characters
-    - Not an IP address
+    Validates if the input is a proper domain name (not an IP address),
+    and explicitly allows 'localhost' for local testing.
     """
-
     if not domain or not isinstance(domain, str):
         return False
 
     domain = domain.strip().lower()
+
+    # Explicitly allow localhost
+    if domain == "localhost":
+        return True
+
+    # Optionally allow local loopback IPs (remove if you want only 'localhost')
+    if domain in ["127.0.0.1", "::1"]:
+        return True
 
     # Reject if it's an IP address
     try:

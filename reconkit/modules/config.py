@@ -1,3 +1,52 @@
+import os
+import json
+from typing import Optional
+
+
+"""
+Persisting cli config
+"""
+
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.reconkit/config.json")
+
+
+DEFAULTS = {
+    "timeout": 20,
+    "workers": 2,
+    "file_format": "txt",
+    "source_delay": 3.0,
+    "min_delay": 1.0,
+    "max_delay": 6.0,
+    "verify_ssl": True,
+    "save_file": False,
+    "debug": False,
+    "log": False,
+    "safe_mode": True,
+    "profile": None 
+}
+
+def load_user_config(path=DEFAULT_CONFIG_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+        return DEFAULTS.copy()
+
+    try:
+        with open(path, "r") as f:
+            user_conf = json.load(f)
+        return {**DEFAULTS, **{k: v for k, v in user_conf.items() if k in DEFAULTS}}
+    except Exception:
+        return DEFAULTS.copy()
+
+
+def save_user_config(data, path=DEFAULT_CONFIG_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({k: v for k, v in data.items() if k in DEFAULTS}, f, indent=2)
+
+
 
 """
 Tech signatures for tech fingerprinting

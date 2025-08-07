@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any
 
 
-def get_headers_cookies(url: str, timeout: int,headers : dict,
+def get_headers_cookies(url: str, timeout: int,throttle : float,headers : dict,
                         verify_ssl: bool, allow_redirects: bool = True ):
 
       
@@ -32,7 +32,7 @@ def get_headers_cookies(url: str, timeout: int,headers : dict,
       """
       
       try:
-            response = reconkit.modules.utils.fetch_with_retry(url,timeout=timeout,headers=headers,allow_redirects=allow_redirects,
+            response = reconkit.modules.utils.fetch_with_retry(url,timeout=timeout,throttle=throttle,headers=headers,allow_redirects=allow_redirects,
                                               verify_ssl=verify_ssl)
 
             if not response or not response.ok:
@@ -140,6 +140,8 @@ def get_tech_stack(
                 tag = rule["tag"]
                 attrs = rule.get("attrs", {})
                 def match_attrs(tag_obj):
+                    if tag_obj is None:
+                        return False
                     for attr_key, attr_val in attrs.items():
                         if attr_key.endswith("_re"):
                             key = attr_key[:-3]
@@ -154,9 +156,12 @@ def get_tech_stack(
                 if soup.find(tag, match_attrs):
                     return True
             elif "selector" in rule:
-                if soup.select_one(rule["selector"]):
+                selector = rule["selector"].replace(":contains(", ":-soup-contains(")
+                if soup.select_one(selector):
                     return True
         return False
+
+
 
     # Wrap signature loop with tqdm + guard
     tech_items = tqdm(TECH_SIGNATURES.items(), desc="Detecting technologies") \

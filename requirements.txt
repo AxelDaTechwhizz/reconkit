@@ -1,21 +1,5 @@
-beautifulsoup4==4.13.4
-bs4==0.0.2
-certifi==2025.7.14
-charset-normalizer==3.4.2
-click==8.2.1
-colorama==0.4.6
-idna==3.10
-iniconfig==2.1.0
-markdown-it-py==3.0.0
-mdurl==0.1.2
-packaging==25.0
-pluggy==1.6.0
-Pygments==2.19.2
+# Dev/test environment setup
+-e .
+
+-r requirements-base.txt
 pytest==8.4.1
-requests==2.32.4
-rich==14.0.0
-shellingham==1.5.4
-soupsieve==2.7
-typer==0.16.0
-typing_extensions==4.14.1
-urllib3==2.5.0

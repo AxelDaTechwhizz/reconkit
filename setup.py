@@ -1,5 +1,11 @@
 from setuptools import setup, find_packages
 
+def load_requirements(path):
+    with open(path, "r") as f:
+        lines = f.read().splitlines()
+        return [line.strip() for line in lines if line.strip() and not line.startswith("#") and not line.startswith("-")]
+
+
 setup(
     name="reconkit",
     version="1.0.0",
@@ -10,7 +16,7 @@ setup(
     url="https://github.com/AxelDaTechwhizz/ReconKit",
     packages=find_packages(),
     include_package_data=True,
-    install_requires=open("requirements.txt").read().splitlines(),
+    install_requires=load_requirements("requirements-base.txt"),
     entry_points={
         'console_scripts': [
             'reconkit=reconkit.cli:app',   # entry -> reconkit/cli.py -> `app` object
