@@ -4,9 +4,11 @@ RECONKIT TOOL WITH:
     - SUBDOMAIN ENUMERATION
     - TECH FINGERPRINTING
     - CVE SCANNER
+    - HTTP Interceptor
+    - Metric Scanner
 """
 
-import typer, requests, os, platform, threading, gzip, shutil
+import typer, requests, os, platform, threading, gzip, shutil,tempfile,subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from deepdiff import DeepDiff
@@ -29,6 +31,11 @@ from reconkit.modules.subdomain import (
     subdomain_from_file,
     generate_custom_wordlist
 )
+from reconkit.modules.interception import (
+    INTERCEPTOR_TEMPLATE, parse_csv_to_list,
+    configure_system_proxy, restore_system_proxy
+    )
+
 
 app = typer.Typer(help="ReconKit: A modular recon tool for dir brute-force, subdomain enum, tech detection, and CVE scanning.")
 app.pretty_exceptions_enabled = True  # Enable pretty exceptions for better error handling
@@ -217,7 +224,7 @@ def callback(ctx : typer.Context,
     
     show_warning_message(ctx)
 
-    if profile == "bugbounty-vidaxl":
+    if profile:
         config.update({
             'profile': profile
         })
@@ -273,12 +280,124 @@ def get_robots_disallowed_paths(base_url: str) -> set:
     return disallowed_paths
 
 
+@app.command("intercept", help="Run proxy-based system-wide HTTP interceptor with advanced filters.")
+def intercept(
+    port: int = typer.Option(8080, "--port", help="Proxy port (default: 8080)"),
+    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring or regex pattern to match in URLs"),
+    exclude: Optional[str] = typer.Option(None, "--exclude", help="Comma-separated domains to exclude from interception"),
+    no_ssl: bool = typer.Option(False, "--no-ssl", help="Disable SSL interception for HTTPS traffic"),
+    status_codes: Optional[str] = typer.Option(None, "--status-codes", help="Comma-separated status codes to log, e.g. '200,404'"),
+    methods: Optional[str] = typer.Option(None, "--methods", help="Comma-separated HTTP methods to log, e.g. 'GET,POST'"),
+    max_body_length: int = typer.Option(500, "--max-body", help="Max characters of body content to log"),
+    sensitive_headers: str = typer.Option("authorization,cookie", "--redact-headers", help="Comma-separated sensitive headers to redact"),
+    log_file: Optional[str] = typer.Option(None, "--log-file", help="File to write logs (default stdout)"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or har"),
+    block_patterns: Optional[str] = typer.Option(None, "--block", help="Comma-separated URL patterns to block"),
+    auto_proxy: bool = typer.Option(False, "--auto-proxy", help="Attempt to configure system proxy automatically"),
+    ssl_cert: Optional[str] = typer.Option(None, "--ssl-cert", help="Path to custom CA certificate for MITM"),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress non-essential output")
+):
+    """
+    Starts mitmproxy (mitmdump) with an advanced interceptor addon applying the given filters.
+    Set your system or browser to proxy via localhost:8080 to capture traffic.
+    """
+    # Parse input parameters
+    status_codes_list = parse_csv_to_list(status_codes, int)
+    methods_list = parse_csv_to_list(methods, str)
+    exclude_list = parse_csv_to_list(exclude, str) if exclude else None
+    sensitive_headers_list = parse_csv_to_list(sensitive_headers.lower(), str) or []
+    block_patterns_list = parse_csv_to_list(block_patterns, str) if block_patterns else None
+
+    # Validate output format
+    if output_format not in ("text", "json", "har"):
+        print_error("Invalid output format. Must be 'text', 'json', or 'har'")
+        raise typer.Exit(code=1)
+
+    # Handle HAR file extension
+    if output_format == "har" and log_file and not log_file.endswith(".har"):
+        log_file += ".har"
+
+    # Prepare proxy configuration
+    if auto_proxy:
+        if not quiet:
+            print_info("Configuring system proxy...")
+        configure_system_proxy()
+
+    # Handle SSL certificate
+    cert_args = []
+    if no_ssl:
+        cert_args.append("--no-ssl")
+    elif ssl_cert:
+        if not os.path.exists(ssl_cert):
+            print_error(f"SSL certificate not found: {ssl_cert}")
+            raise typer.Exit(code=1)
+        cert_args.extend(["--certs", ssl_cert])
+
+    # Format Python literals for string insertion
+    url_contains_py = f'"{url_contains}"' if url_contains else "None"
+    status_codes_py = str(status_codes_list) if status_codes_list else "None"
+    methods_py = str([m.upper() for m in methods_list]) if methods_list else "None"
+    sensitive_headers_py = str(sensitive_headers_list) if sensitive_headers_list else "None"
+    log_file_py = f'"{log_file}"' if log_file else "None"
+    block_patterns_py = str(block_patterns_list) if block_patterns_list else "None"
+    exclude_py = str(exclude_list) if exclude_list else "None"
+
+    # Generate the interceptor script
+    script_code = INTERCEPTOR_TEMPLATE.format(
+        port=port,
+        url_contains=url_contains_py,
+        status_codes=status_codes_py,
+        max_body_length=max_body_length,
+        sensitive_headers=sensitive_headers_py,
+        log_file=log_file_py,
+        methods=methods_py,
+        block_patterns=block_patterns_py,
+        output_format=f'"{output_format}"',
+        exclude_domains=exclude_py,
+        no_ssl="True" if no_ssl else "False"
+    )
+
+    # Write temporary script file
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+        tf.write(script_code)
+        script_path = tf.name
+
+    try:
+        if not quiet:
+            print_info("Starting proxy interceptor... Press Ctrl+C to stop.")
+            print_info(f"Configure your client to use proxy: http://localhost:8080")
+            if output_format == "har":
+                print_info(f"HAR output will be saved to: {log_file or 'stdout'}")
+
+        # Run mitmdump subprocess with enhanced arguments
+        cmd = ["mitmdump","-p", str(port), "-s", script_path, *cert_args]
+        if quiet:
+            cmd.append("-q")
+        subprocess.run(cmd,check=True)
+    except KeyboardInterrupt:
+        if not quiet:
+            print_info("\nProxy interceptor stopped by user.")
+    finally:
+        try:
+            if not quiet:
+                print_info("Cleaning up temporary script file...")
+            os.unlink(script_path)
+            if auto_proxy:
+                if not quiet:
+                    print_info("Restoring original proxy settings...")
+                restore_system_proxy()
+        except Exception as e:
+            print_warning(f"Failed to clean up temporary files: {e}", show_traceback=config.get("debug"))
+
+    
+
 @app.command("dirscan")
 @safe_cli
 def bruteforce_dirs(
     url: str = typer.Option(..., '-u', '--url', help='Target URL to brute-force'),
     word_list: str = typer.Option(..., '-F', '--filepath', help='Path to directory wordlist'),
     headers: str = typer.Option(None, '-H', '--headers', help='Optional headers'),
+    robots: bool = typer.Option(True,"--respect-robots",help = "Respects the robot.txt of the site"),
     mode: str = typer.Option("normal", "--mode", help="Scan mode: normal | safe | smart"),
     output: str = typer.Option(None, '-o', help="Output filename for results")
 ):
@@ -314,17 +433,17 @@ def bruteforce_dirs(
                 f.writelines(lines[:SAFE_MODE_SETTINGS["max_wordlist_size"]])
                 word_list = f.name
             print_info(f"[safe-mode] Wordlist truncated to {SAFE_MODE_SETTINGS['max_wordlist_size']} entries.", log=config["log"])
-
-        if config.get("respect_robots"):
-            disallowed_paths = get_robots_disallowed_paths(validated_url)
-            if disallowed_paths:
-                print_info(f"[robots.txt] Filtering {len(disallowed_paths)} disallowed paths from wordlist.", log=config["log"])
-                with open(word_list) as f:
-                    original_lines = f.readlines()
-                filtered_lines = [line for line in original_lines if not any(line.strip().startswith(path.lstrip('/')) for path in disallowed_paths)]
-                with NamedTemporaryFile(mode='w+', delete=False) as tmp:
-                    tmp.writelines(filtered_lines)
-                    word_list = tmp.name
+        
+    if robots:
+        disallowed_paths = get_robots_disallowed_paths(validated_url)
+        if disallowed_paths:
+            print_info(f"[robots.txt] Filtering {len(disallowed_paths)} disallowed paths from wordlist.", log=config["log"])
+            with open(word_list) as f:
+                original_lines = f.readlines()
+            filtered_lines = [line for line in original_lines if not any(line.strip().startswith(path.lstrip('/')) for path in disallowed_paths)]
+            with NamedTemporaryFile(mode='w+', delete=False) as tmp:
+                tmp.writelines(filtered_lines)
+                word_list = tmp.name
 
     # --- SMART MODE LOGIC ---
     if mode == "smart":

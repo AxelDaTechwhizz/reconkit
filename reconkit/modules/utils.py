@@ -1,30 +1,16 @@
-"""
-Helper functions for the tool
-"""
-import os
-import json
-import csv
-import string
-import requests
-import re
-import traceback
+import json,csv,string,datetime,time,os,requests,re,traceback
 from random import uniform
 from time import sleep
-from typing import Any,Optional
+from typing import Any,Optional,Union,Tuple,Iterable
 from urllib.parse import urlparse
 from colorama import Fore,init,Style
+from reconkit.modules.interception import HttpInterceptor
 
-"""
-colorama initialization
-This will allow us to use colored output in the terminal
-"""
+
 # initialize Colorama
 init(autoreset=True)
 
-"""
-Functions to print messages in different colors
-These functions will be used to print messages in the terminal
-"""
+
 def print_info(message, log : bool = False):
     if log:
         log_to_file(message, 'debug')
@@ -53,88 +39,6 @@ def print_error(message, log : bool = True,show_traceback : bool = False):
         print(Fore.RED + traceback.format_exc())
 
 
-"""
-Functions to fetch URLs and handle errors
-"""
-
-# Disable SSL warnings
-requests.packages.urllib3.disable_warnings()
-
-def fetch_url(url: str, headers: Optional[dict], timeout: int,
-              verify_ssl: bool, allow_redirects: bool = True):
-    """
-    Fetches the given URL with optional headers and SSL verification.
-
-    :param url: The full URL to request (http/https)
-    :param headers: Optional headers dict
-    :param timeout: Timeout in seconds
-    :param verify_ssl: Whether to verify SSL certificates
-    """
-    try:
-        response = requests.get(url, headers=headers, timeout=timeout,
-                                allow_redirects=allow_redirects, verify=verify_ssl)
-        return response
-    except requests.exceptions.Timeout:
-        print_warning(f'[!⏰] Request timed out: {url}')
-        raise
-    except requests.ConnectionError:
-        print_warning(f"[/('_')\\] Connection error: {url}")
-        raise
-    except requests.RequestException as e:
-        print_warning(f"[x_x] Request failed: {url} | {e}")
-        raise
-
-
-
-from time import sleep
-from random import uniform
-
-def fetch_with_retry(url: str, headers: dict, timeout: int, verify_ssl: bool,
-                     allow_redirects: bool, throttle: float, retries: int = 3):
-    """Fetch a URL with retry and exponential backoff. Returns response or None."""
-    throttle = AdaptiveThrottle(throttle)
-    default_wait_time = 10
-
-    for attempt in range(retries):
-        try:
-            throttle.wait()
-            response = fetch_url(url, headers=headers, timeout=timeout,
-                                 allow_redirects=allow_redirects, verify_ssl=verify_ssl)
-
-            if response.status_code in [429, 503]:
-                retry_after = response.headers.get("Retry-After")
-                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else default_wait_time
-                throttle.failure()
-            else:
-                throttle.success()
-                return response
-
-        except Exception as e:
-            print_error(f"Fetch failed: {e}")
-            wait_time = default_wait_time
-
-        sleep(wait_time ** attempt + uniform(0, 1))
-
-    return None  # ✅ Don't raise — let caller handle it
-
-
-
-"""
-Function to validate a URL
-"""
-
-def validate_url(url: str) -> str | None:
-    """
-    Validates and normalizes a URL. Adds scheme if missing.
-    Returns the valid URL or None if invalid.
-    """
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid URL format: {url}")
-    return url
-    
- 
-import time
 
 class AdaptiveThrottle:
     def __init__(self, base_wait: float):
@@ -159,6 +63,147 @@ class AdaptiveThrottle:
         self.failures += 1
         self.multiplier = min(self.max_multiplier, self.multiplier * 2)
         print_info(f"[Throttle] Failure #{self.failures} detected, increasing wait multiplier to {self.multiplier}.")
+
+
+"""
+Functions to fetch URLs and handle errors
+"""
+
+# Disable SSL warnings
+requests.packages.urllib3.disable_warnings()
+
+
+from typing import Optional, Union, Tuple
+import requests
+
+def fetch_url(
+    url: str,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    timeout: Union[float, Tuple[float, float]] = (3.05, 30),
+    verify_ssl: bool = True,
+    allow_redirects: bool = True,
+    session: Optional[requests.Session] = None,
+    body: Optional[Union[str, bytes]] = None,
+    interceptor: Optional[HttpInterceptor] = None  # pass interceptor instance here
+) -> Optional[requests.Response]:
+    try:
+        effective_session = session or requests.Session()
+        req = requests.Request(method, url, headers=headers, data=body)
+        prepped = effective_session.prepare_request(req)
+
+        if interceptor:
+            interceptor.log_traffic(prepped)
+
+        resp = effective_session.send(
+            prepped,
+            timeout=timeout,
+            allow_redirects=allow_redirects,
+            verify=verify_ssl,
+            stream=True,
+        )
+
+        content_length = int(resp.headers.get('Content-Length', 0) or 0)
+        if content_length > 10_000_000:
+            resp.close()
+            raise ValueError("Response too large")
+
+        if interceptor:
+            interceptor.log_traffic(prepped, resp)
+
+        return resp
+
+    except requests.exceptions.RequestException as e:
+        print_warning(f"Request failed: {url} - {type(e).__name__}")
+        return None
+
+
+def fetch_with_retry(
+    url: str,
+    headers: Optional[dict] = None,
+    timeout: Union[float, Tuple[float, float]] = (3.05, 30),
+    verify_ssl: bool = True,
+    allow_redirects: bool = True,
+    throttle: Optional[AdaptiveThrottle] = None,
+    retries: int = 3,
+    session: Optional[requests.Session] = None,
+    success_codes: Iterable[int] = (200, 201, 202, 204),
+    interceptor: Optional[HttpInterceptor] = None
+) -> Optional[requests.Response]:
+
+    def parse_retry_after(headers: dict) -> float:
+        retry_after = headers.get('Retry-After', '').strip()
+        if not retry_after:
+            return 10.0
+        if retry_after.isdigit():
+            return float(retry_after)
+        try:
+            from email.utils import parsedate_to_datetime
+            retry_time = parsedate_to_datetime(retry_after)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            delay = (retry_time - now).total_seconds()
+            return max(0.0, delay)
+        except Exception:
+            return 10.0
+
+    throttle = throttle or AdaptiveThrottle(1.0)
+
+    for attempt in range(1, retries + 1):
+        try:
+            throttle.wait()
+            resp = fetch_url(
+                url=url,
+                headers=headers,
+                timeout=timeout,
+                verify_ssl=verify_ssl,
+                allow_redirects=allow_redirects,
+                session=session,
+                interceptor=interceptor
+            )
+            if not resp:
+                continue
+
+            if resp.status_code in success_codes:
+                throttle.success()
+                return resp
+
+            if resp.status_code == 429:
+                retry_after = parse_retry_after(resp.headers)
+                print_warning(f"Rate limited - retrying after {retry_after}s")
+                sleep(retry_after)
+                continue
+
+            if resp.status_code >= 500:
+                print_warning(f"Server error (attempt {attempt}/{retries})")
+                throttle.failure()
+                continue
+
+            # Other 4xx errors: don't retry
+            return None
+
+        except Exception as e:
+            print_warning(f"Attempt {attempt} failed: {str(e)}")
+            throttle.failure()
+
+    return None
+
+
+
+
+"""
+Function to validate a URL
+"""
+
+def validate_url(url: str) -> str | None:
+    """
+    Validates and normalizes a URL. Adds scheme if missing.
+    Returns the valid URL or None if invalid.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid URL format: {url}")
+    return url
+    
 
 def random_throttle(min_delay : float, max_delay:float):
     """
