@@ -21,7 +21,6 @@ DEFAULTS = {
     "save_file": False,
     "debug": False,
     "log": False,
-    "safe_mode": True,
     "profile": None 
 }
 

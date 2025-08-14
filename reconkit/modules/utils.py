@@ -1,10 +1,11 @@
-import json,csv,string,datetime,time,os,requests,re,traceback
+import json, csv, string, datetime, time, os, requests, re, traceback
 from random import uniform
 from time import sleep
 from typing import Any,Optional,Union,Tuple,Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlparse,urlunparse
 from colorama import Fore,init,Style
 from reconkit.modules.interception import HttpInterceptor
+from ipaddress import ip_address
 
 
 # initialize Colorama
@@ -146,7 +147,9 @@ def fetch_with_retry(
         except Exception:
             return 10.0
 
-    throttle = throttle or AdaptiveThrottle(1.0)
+    if not isinstance(throttle, AdaptiveThrottle):
+        throttle = AdaptiveThrottle(throttle if isinstance(throttle, (int, float)) else 1.0)
+
 
     for attempt in range(1, retries + 1):
         try:
@@ -188,20 +191,39 @@ def fetch_with_retry(
     return None
 
 
-
-
 """
 Function to validate a URL
 """
+import socket
 
-def validate_url(url: str) -> str | None:
-    """
-    Validates and normalizes a URL. Adds scheme if missing.
-    Returns the valid URL or None if invalid.
-    """
+
+def validate_url(url: str) -> str:
+    """Extended validation with protocol auto-correction that accepts localhost and 127.0.0.1 with ports"""
+    if not url.startswith(('http://', 'https://')):
+        url = f'https://{url}'
+    
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid URL format: {url}")
+    if not all([parsed.scheme, parsed.netloc]):
+        raise ValueError(f"Invalid URL: {url}")
+    
+    # Extract hostname and port if present
+    netloc_parts = parsed.netloc.split(':')
+    hostname = netloc_parts[0]
+    port = int(netloc_parts[1]) if len(netloc_parts) > 1 else None
+    
+    # Special handling for localhost and loopback addresses (with or without ports)
+    if hostname.lower() in ('localhost', '127.0.0.1', '[::1]'):
+        # Validate port if specified
+        if port is not None and not (0 < port <= 65535):
+            raise ValueError(f"Invalid port number: {port}")
+        return url
+    
+    # Verify DNS resolution for non-localhost domains
+    try:
+        socket.gethostbyname(hostname)
+    except socket.gaierror:
+        raise ValueError(f"Domain {hostname} doesn't resolve")
+    
     return url
     
 
@@ -443,9 +465,6 @@ def log_to_file(message: str, level: str = 'info'):
 validate_domain function to check if a string is a valid domain name
 """
 
-import ipaddress
-
-
 def is_valid_domain(domain: str) -> bool:
     """
     Validates if the input is a proper domain name (not an IP address),
@@ -460,13 +479,13 @@ def is_valid_domain(domain: str) -> bool:
     if domain == "localhost":
         return True
 
-    # Optionally allow local loopback IPs (remove if you want only 'localhost')
+    # Optionally allow local loopback IPs 
     if domain in ["127.0.0.1", "::1"]:
         return True
 
     # Reject if it's an IP address
     try:
-        ipaddress.ip_address(domain)
+        ip_address(domain)
         return False
     except ValueError:
         pass

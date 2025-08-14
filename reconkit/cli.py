@@ -8,24 +8,27 @@ RECONKIT TOOL WITH:
     - Metric Scanner
 """
 
-import typer, requests, os, platform, threading, gzip, shutil,tempfile,subprocess
+import re, typer, time, requests, json, os, platform, threading, gzip, shutil, tempfile, subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from deepdiff import DeepDiff
-from functools import lru_cache
-from reconkit.modules.cvescanner import scan_for_cves_local,init_cve_db,import_cves_from_json
-from urllib.parse import urlparse,urljoin
+from functools import lru_cache, wraps
+from urllib.parse import urlparse, urljoin
 from datetime import datetime
-from typing import Optional
-from functools import wraps
+from typing import Optional, List, Dict, Callable
 from tempfile import NamedTemporaryFile
-from reconkit.modules.dirbrute import http_dir_bruteforcer,extract_path_prefixes_from_html
+from dataclasses import dataclass
+
+# Import all module components
+from reconkit.modules.cvescanner import scan_for_cves_local, init_cve_db, import_cves_from_json
+from reconkit.modules.dirbrute import http_dir_bruteforcer, extract_path_prefixes_from_html
 from reconkit.modules.techfingerprint import get_headers_cookies, get_tech_stack, get_ssl_info
 from reconkit.modules.config import load_user_config, save_user_config, DEFAULT_CONFIG_PATH
 from reconkit.modules.utils import (
-    validate_url,print_error,print_success,print_warning,print_info,is_valid_domain,
-    validate_input_file,save_to_file,list_files_in_folder,fetch_with_retry,
-    log_to_file)
+    validate_url, print_error, print_success, print_warning, print_info,
+    is_valid_domain, validate_input_file, save_to_file, list_files_in_folder,
+    fetch_with_retry, log_to_file
+)
 from reconkit.modules.subdomain import (
     subdomain_finder,
     subdomain_from_file,
@@ -34,15 +37,28 @@ from reconkit.modules.subdomain import (
 from reconkit.modules.interception import (
     INTERCEPTOR_TEMPLATE, parse_csv_to_list,
     configure_system_proxy, restore_system_proxy
-    )
+)
+from reconkit.modules.metricprobe import scan_target, batch_metric_probe
 
+
+@dataclass
+class TrafficRule:
+    """Defines rules for traffic modification in the interceptor"""
+    pattern: str          # Regex pattern to match
+    action: str           # 'modify', 'block', 'redirect', 'mock'
+    replacement: Optional[str] = None       # For modify/redirect actions
+    headers: Optional[Dict[str, str]] = None # Headers to add/modify
+    status_code: Optional[int] = None       # For mock responses
+    mock_response: Optional[Dict] = None    # Complete mock response
 
 app = typer.Typer(help="ReconKit: A modular recon tool for dir brute-force, subdomain enum, tech detection, and CVE scanning.")
-app.pretty_exceptions_enabled = True  # Enable pretty exceptions for better error handling
+app.pretty_exceptions_enabled = True
 
+# Constants
 CVE_DB_PATH = "cves.db"
+__version__ = "2.2.0"  # Updated version
 
-
+# Configuration
 config = load_user_config()
 
 SAFE_MODE_SETTINGS = {
@@ -52,93 +68,83 @@ SAFE_MODE_SETTINGS = {
     "limit_tech_stack": True    # Don't run SSL info or deep matching
 }
 
-__version__ = "2.0.0"
-
+# Helper Functions
 def print_version_and_exit(value: bool):
     if value:
         print_success(f"ReconKit version {__version__}", log=config.get("log"))
         raise typer.Exit()
 
-
 def safe_cli(f):
-    @wraps(f)  # ← critical to preserve signature
+    @wraps(f)
     def wrapper(*args, **kwargs):
         try:
             return f(*args, **kwargs)
         except Exception as e:
-            print_error(f"Experienced error: {e}", show_traceback=config.get("debug"))
+            print_error(f"Error: {e}", show_traceback=config.get("debug"))
             raise typer.Exit(code=1)
     return wrapper
 
-import time
-
 def auto_tune_rate_limits(url: str):
-    """Measure average response speed using fetch_with_retry, and auto-tune scan delay accordingly."""
+    """Enhanced auto-tuning with jitter calculation"""
     try:
         delays = []
-        headers = {}
-        verify_ssl = config['verify_ssl']
-        timeout = config['timeout']
-        throttle = config.get('source_delay', 0.5)
-
+        headers = prepare_headers()
+        
         for _ in range(5):
             start = time.time()
             response = fetch_with_retry(
                 url=url,
                 headers=headers,
-                timeout=timeout,
-                verify_ssl=verify_ssl,
-                allow_redirects=True,
-                throttle=throttle,
-                retries=3
+                timeout=config['timeout'],
+                verify_ssl=config['verify_ssl'],
+                throttle=config['source_delay']
             )
             elapsed = time.time() - start
-
             if response and response.status_code < 400:
                 delays.append(elapsed)
 
-        if not delays:
-            print_warning("[smart-dirscan] No valid responses received for tuning.")
-            return
-
-        avg = sum(delays) / len(delays)
-
-        # Adjust throttle based on average
-        if avg > 2.0:
-            config['source_delay'] = 4
-        elif avg > 1.0:
-            config['source_delay'] = 2
-        elif avg > 0.5:
-            config['source_delay'] = 1
-        else:
-            config['source_delay'] = 0
-
-        print_info(f"[smart-dirscan] Auto-tuned source delay to {config['source_delay']}s (avg: {avg:.2f}s)", log=config['log'])
-
+        if delays:
+            avg = sum(delays) / len(delays)
+            jitter = max(delays) - min(delays)
+            
+            # More sophisticated tuning
+            if avg > 2.0:
+                new_delay = min(avg + jitter, config['max_delay'])
+            elif avg > 1.0:
+                new_delay = max(avg, config['min_delay'])
+            else:
+                new_delay = config['min_delay']
+            
+            config['source_delay'] = new_delay
+            print_info(f"[auto-tune] Set delay to {new_delay:.2f}s (avg: {avg:.2f}s, jitter: {jitter:.2f}s)", 
+                      log=config['log'])
     except Exception as e:
-        print_warning(f"[smart-dirscan] Auto-tuning failed: {e}")
+        print_warning(f"[auto-tune] Failed: {e}")
 
 
 
 def prepare_headers(input_headers: Optional[str] = None) -> dict:
-    headers_dict = {}
-
-    # Parse semi-colon-separated headers
+    """Enhanced header preparation with security headers"""
+    headers_dict = {
+        "User-Agent": "ReconKit/2.2",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive"
+    }
+    
     if input_headers:
         for item in input_headers.split(';'):
             if ':' in item:
                 key, value = item.strip().split(':', 1)
                 headers_dict[key.strip()] = value.strip()
 
-    # Set default User-Agent if missing
-    headers_dict.setdefault("User-Agent", "ReconKit/2.0")
 
     # Profile-specific User-Agent tagging
     PROFILE_UA_TAGS = {
     "bugbounty-vidaxl": " -BugBounty-vidaxl-holding-31337",
     "yeswehack-dojo": " -BugBounty-yeswehack-dojo",
 }
-
 
     profile = config.get("profile")
     ua_tag = PROFILE_UA_TAGS.get(profile)
@@ -148,7 +154,7 @@ def prepare_headers(input_headers: Optional[str] = None) -> dict:
 
     return headers_dict
 
-def apply_profile(profile_name: str, log: bool):
+def apply_profile(profile_name: str):
     if profile_name == "bugbounty-vidaxl":
         print_info("[*] Profile 'bugbounty-vidaxl' activated.", log=config["log"])
         config.update({
@@ -156,7 +162,6 @@ def apply_profile(profile_name: str, log: bool):
             'source_delay': 3.0,
             'min_delay': 2.0,
             'max_delay': 6.0,
-            'safe_mode': True,
             'disable_dirbrute': True
         })
 
@@ -167,7 +172,6 @@ def apply_profile(profile_name: str, log: bool):
             'source_delay': 3.0,
             'min_delay': 1.0,
             'max_delay': 5.5,
-            'safe_mode': True,
             'disable_dirbrute': False,
             'respect_robots': True,
             'timeout': 15
@@ -192,30 +196,29 @@ def show_support():
 
 @app.callback(invoke_without_command=True)
 @safe_cli
-def callback(ctx : typer.Context,
-    version: Optional[bool] = typer.Option(
-        None,
-        "--version",
-        "-v",
-        help="Show the version and exit",
-        is_flag=True,
-        callback=print_version_and_exit,
-        expose_value=False,  # Don't pass this as argument to commands
-    ),
-    timeout: int = typer.Option(20, '-t', '--timeout', help='Request timeout (in seconds)'),
-    workers: int = typer.Option(10, '-w', '--workers', help='Number of threads to execute task'),
-    file_format: str = typer.Option('txt', '-f', '--format', help='File format to save results (txt, csv, json)'),
-    throttle: float = typer.Option(1.0, '-th', '--throttle', help='Base wait time between sources'),
-    throttle_min: float = typer.Option(1.0, '-tm', '--throttle-min', help='Minimum delay (rate limit buffer)'),
-    throttle_max: float = typer.Option(4.0, '-tx', '--throttle-max', help='Maximum delay (rate limit buffer)'),
-    verify_ssl: bool = typer.Option(True, '-s', '--verify-ssl', help='Verify SSL certificates'),
-    save_file: bool = typer.Option(False, '-S', '--savefile', help='Save output to file'),
-    debug: bool = typer.Option(False, '--debug', help='Show full error tracebacks for debugging'),
-    log : bool = typer.Option(False,'--log', help = "Log output messages to file.\n i.e. error messages log by default"),
-    profile: Optional[str] = typer.Option(None, '--profile', '-p', help='Use a predefined scan profile (e.g., bugbounty-vidaxl)'),
-    save_conf: bool = typer.Option(False, "--save-config", help="Save current settings to defaults.json"),
-    support : bool = typer.Option(False,'--support', help = "Show some support to a guy who lives on coffee and prayers xD.\nGod bless you!! :) ")
-    ):
+def callback(
+    ctx: typer.Context,
+    version: Optional[bool] = typer.Option(None, "--version", "-v", callback=print_version_and_exit),
+    timeout: int = typer.Option(20, '-t', '--timeout'),
+    workers: int = typer.Option(10, '-w', '--workers'),
+    file_format: str = typer.Option('txt', '-f', '--format'),
+    throttle: float = typer.Option(2.5, '-th', '--throttle'),
+    throttle_min: float = typer.Option(2.0, '-tm', '--throttle-min'),
+    throttle_max: float = typer.Option(6.0, '-tx', '--throttle-max'),
+    verify_ssl: bool = typer.Option(True, '-s', '--verify-ssl'),
+    debug: bool = typer.Option(False, '--debug'),
+    log: bool = typer.Option(False, '--log'),
+    profile: Optional[str] = typer.Option(None, '--profile', '-p'),
+    save_conf: bool = typer.Option(False, "--save-config"),
+    support: bool = typer.Option(False, '--support')
+):
+    """Enhanced main callback with new features"""
+    if support:
+        show_support()
+    
+    if ctx.invoked_subcommand is None:
+        show_warning_message(ctx)
+        raise typer.Exit()
 
     ensure_data_dirs()
     
@@ -241,7 +244,6 @@ def callback(ctx : typer.Context,
         "min_delay": throttle_min,
         "max_delay": throttle_max,
         "verify_ssl": verify_ssl,
-        "save_file": save_file,
         "debug": debug,
         "log": log,
         "profile" : profile
@@ -280,50 +282,174 @@ def get_robots_disallowed_paths(base_url: str) -> set:
     return disallowed_paths
 
 
-@app.command("intercept", help="Run proxy-based system-wide HTTP interceptor with advanced filters.")
+@app.command("intercept", help="Run proxy-based HTTP interceptor with advanced filters.")
 def intercept(
-    port: int = typer.Option(8080, "--port", help="Proxy port (default: 8080)"),
-    url_contains: Optional[str] = typer.Option(None, "--url-contains", help="Substring or regex pattern to match in URLs"),
-    exclude: Optional[str] = typer.Option(None, "--exclude", help="Comma-separated domains to exclude from interception"),
-    no_ssl: bool = typer.Option(False, "--no-ssl", help="Disable SSL interception for HTTPS traffic"),
-    status_codes: Optional[str] = typer.Option(None, "--status-codes", help="Comma-separated status codes to log, e.g. '200,404'"),
-    methods: Optional[str] = typer.Option(None, "--methods", help="Comma-separated HTTP methods to log, e.g. 'GET,POST'"),
-    max_body_length: int = typer.Option(500, "--max-body", help="Max characters of body content to log"),
-    sensitive_headers: str = typer.Option("authorization,cookie", "--redact-headers", help="Comma-separated sensitive headers to redact"),
-    log_file: Optional[str] = typer.Option(None, "--log-file", help="File to write logs (default stdout)"),
-    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or har"),
-    block_patterns: Optional[str] = typer.Option(None, "--block", help="Comma-separated URL patterns to block"),
-    auto_proxy: bool = typer.Option(False, "--auto-proxy", help="Attempt to configure system proxy automatically"),
-    ssl_cert: Optional[str] = typer.Option(None, "--ssl-cert", help="Path to custom CA certificate for MITM"),
-    quiet: bool = typer.Option(False, "--quiet", help="Suppress non-essential output")
+    targets: Optional[str] = typer.Option(None, "--targets", help="Comma-separated target domains (leave empty for system-wide)"),
+    port: int = typer.Option(8080, "--port"),
+    url_contains: Optional[str] = typer.Option(None, "--url-contains"),
+    exclude: Optional[str] = typer.Option(None, "--exclude"),
+    no_ssl: bool = typer.Option(False, "--no-ssl"),
+    status_codes: Optional[str] = typer.Option(None, "--status-codes"),
+    methods: Optional[str] = typer.Option(None, "--methods"),
+    max_body_length: int = typer.Option(500, "--max-body"),
+    sensitive_headers: str = typer.Option("authorization,cookie", "--redact-headers"),
+    log_file: Optional[str] = typer.Option(None, "--log-file"),
+    output_format: str = typer.Option("har", "--format"),
+    block_patterns: Optional[str] = typer.Option(None, "--block"),
+    auto_proxy: bool = typer.Option(False, "--auto-proxy"),
+    ssl_cert: Optional[str] = typer.Option(None, "--ssl-cert"),
+    quiet: bool = typer.Option(False, "--quiet"),
+    rules_file: Optional[str] = typer.Option(None, "--rules-file", help="JSON file containing traffic rules"),
+    test_rules: bool = typer.Option(False, "--test-rules", help="Validate rules file without running interceptor"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be intercepted without running"),
+    preview_rules: bool = typer.Option(False, "--preview-rules", help="Display loaded rules before starting")
 ):
-    """
-    Starts mitmproxy (mitmdump) with an advanced interceptor addon applying the given filters.
-    Set your system or browser to proxy via localhost:8080 to capture traffic.
-    """
-    # Parse input parameters
-    status_codes_list = parse_csv_to_list(status_codes, int)
-    methods_list = parse_csv_to_list(methods, str)
+
+    # Determine target interception mode
+    """Run proxy-based HTTP interceptor in target-specific or system-wide mode."""
+
+    # Parse targets
+    target_list = []
+    if targets:
+        target_list = [t.strip() for t in targets.split(",") if t.strip()]
+
+    # Decide mode
+    if target_list:
+        interception_mode = "targeted"
+        if not quiet:
+            print_info(f"🎯 Running in targeted mode for: {', '.join(target_list)}")
+    else:
+        interception_mode = "system-wide"
+        if not quiet:
+            print_info("🌐 Running in system-wide mode (all HTTP/S traffic)")
+    
+    # Validate output format first
+    valid_formats = ["har", "json", "txt"]
+    if output_format.lower() not in valid_formats:
+        print_error(f"Invalid output format. Must be one of: {', '.join(valid_formats)}")
+        raise typer.Exit(code=1)
+    output_format = output_format.lower()
+
+    # Parse and validate status codes
+    status_codes_list = []
+    if status_codes:
+        try:
+            status_codes_list = [int(code) for code in status_codes.split(',')]
+            if not all(100 <= code <= 599 for code in status_codes_list):
+                raise ValueError("Status codes must be between 100-599")
+        except ValueError as e:
+            print_error(f"Invalid status codes: {e}")
+            raise typer.Exit(code=1)
+
+    # Parse and validate methods
+    valid_methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']
+    methods_list = []
+    if methods:
+        try:
+            methods_list = [m.strip().upper() for m in methods.split(',')]
+            if not all(m in valid_methods for m in methods_list):
+                raise ValueError(f"Invalid method. Must be one of: {', '.join(valid_methods)}")
+        except ValueError as e:
+            print_error(f"Invalid methods: {e}")
+            raise typer.Exit(code=1)
+
+    # Parse other lists
     exclude_list = parse_csv_to_list(exclude, str) if exclude else None
     sensitive_headers_list = parse_csv_to_list(sensitive_headers.lower(), str) or []
     block_patterns_list = parse_csv_to_list(block_patterns, str) if block_patterns else None
 
-    # Validate output format
-    if output_format not in ("text", "json", "har"):
-        print_error("Invalid output format. Must be 'text', 'json', or 'har'")
-        raise typer.Exit(code=1)
+    # Load and validate traffic rules
+    rules_list = []
+    if rules_file:
+        try:
+            with open(rules_file, 'r') as f:
+                rules_data = json.load(f)
+                if not isinstance(rules_data, list):
+                    rules_data = [rules_data]
+                
+                for rule in rules_data:
+                    # Validate required fields
+                    if not all(k in rule for k in ['pattern', 'action']):
+                        raise ValueError("Rules must contain 'pattern' and 'action' fields")
+                    # Validate action types
+                    if rule['action'] not in ['modify', 'block', 'redirect', 'mock', 'modify_response']:
+                        raise ValueError(f"Invalid action type: {rule['action']}")
+                    rules_list.append(TrafficRule(**rule))
+            
+            if not quiet:
+                print_info(f"Loaded {len(rules_list)} traffic rules from {rules_file}")
+        except Exception as e:
+            print_error(f"Failed to load rules file: {e}")
+            raise typer.Exit(code=1)
 
-    # Handle HAR file extension
-    if output_format == "har" and log_file and not log_file.endswith(".har"):
-        log_file += ".har"
+    # --test-rules flag implementation
+    if test_rules:
+        if not rules_file:
+            print_error("--test-rules requires --rules-file")
+            raise typer.Exit(code=1)
+        print_success(f"✓ Successfully validated {len(rules_list)} rules in {rules_file}")
+        raise typer.Exit()
+
+    # --dry-run mode implementation
+    if dry_run:
+        print_info("\n=== DRY RUN MODE ===")
+        print_info("The following traffic would be intercepted:")
+        print_info(f"• URL contains: {url_contains or 'Any'}")
+        print_info(f"• Methods: {', '.join(methods_list) if methods_list else 'All'}")
+        print_info(f"• Status codes: {', '.join(map(str, status_codes_list)) if status_codes_list else 'All'}")
+        print_info(f"• Block patterns: {', '.join(block_patterns_list) if block_patterns_list else 'None'}")
+        print_info(f"• Excluded domains: {', '.join(exclude_list) if exclude_list else 'None'}")
+        print_info(f"• Output format: {output_format}")
+        print_info(f"• Log file: {log_file or 'stdout'}")
+        
+        if rules_list:
+            print_info("\nRules that would be applied:")
+            for i, rule in enumerate(rules_list, 1):
+                print_info(f"{i}. Pattern: {rule.pattern}")
+                print_info(f"   Action: {rule.action}")
+                if rule.replacement:
+                    print_info(f"   Replacement: {rule.replacement}")
+                if rule.headers:
+                    print_info(f"   Headers: {json.dumps(rule.headers)}")
+                if rule.status_code:
+                    print_info(f"   Status code: {rule.status_code}")
+        
+        print_info("\nNo traffic will actually be intercepted (dry run mode)")
+        raise typer.Exit()
+
+    # --preview-rules flag implementation
+    if preview_rules and rules_list:
+        print_info("\n=== LOADED RULES PREVIEW ===")
+        for i, rule in enumerate(rules_list, 1):
+            print_info(f"{i}. Pattern: {rule.pattern}")
+            print_info(f"   Action: {rule.action}")
+            if rule.replacement:
+                print_info(f"   Replacement: {rule.replacement}")
+            if rule.headers:
+                print_info(f"   Headers: {json.dumps(rule.headers)}")
+            if rule.status_code:
+                print_info(f"   Status code: {rule.status_code}")
+            if rule.mock_response:
+                print_info(f"   Mock response: {json.dumps(rule.mock_response, indent=2)}")
+        
+        if not quiet:
+            confirm = typer.confirm("\nContinue with these rules?")
+            if not confirm:
+                raise typer.Exit()
 
     # Prepare proxy configuration
+    if auto_proxy and port not in [8080, 8888] and not quiet:
+        confirm = typer.confirm(f"⚠️  Configure system proxy to use port {port}?")
+        if not confirm:
+            auto_proxy = False
+            print_info("Auto-proxy configuration skipped", log=config.get("log"))
+
     if auto_proxy:
         if not quiet:
             print_info("Configuring system proxy...")
-        configure_system_proxy()
+        configure_system_proxy(port)
 
-    # Handle SSL certificate
+    # Handle SSL certificate arguments
     cert_args = []
     if no_ssl:
         cert_args.append("--no-ssl")
@@ -331,31 +457,29 @@ def intercept(
         if not os.path.exists(ssl_cert):
             print_error(f"SSL certificate not found: {ssl_cert}")
             raise typer.Exit(code=1)
+        if not os.path.isfile(ssl_cert):
+            print_error(f"SSL certificate path must be a file: {ssl_cert}")
+            raise typer.Exit(code=1)
         cert_args.extend(["--certs", ssl_cert])
-
-    # Format Python literals for string insertion
-    url_contains_py = f'"{url_contains}"' if url_contains else "None"
-    status_codes_py = str(status_codes_list) if status_codes_list else "None"
-    methods_py = str([m.upper() for m in methods_list]) if methods_list else "None"
-    sensitive_headers_py = str(sensitive_headers_list) if sensitive_headers_list else "None"
-    log_file_py = f'"{log_file}"' if log_file else "None"
-    block_patterns_py = str(block_patterns_list) if block_patterns_list else "None"
-    exclude_py = str(exclude_list) if exclude_list else "None"
 
     # Generate the interceptor script
     script_code = INTERCEPTOR_TEMPLATE.format(
-        port=port,
-        url_contains=url_contains_py,
-        status_codes=status_codes_py,
-        max_body_length=max_body_length,
-        sensitive_headers=sensitive_headers_py,
-        log_file=log_file_py,
-        methods=methods_py,
-        block_patterns=block_patterns_py,
-        output_format=f'"{output_format}"',
-        exclude_domains=exclude_py,
-        no_ssl="True" if no_ssl else "False"
+        repr(port),
+        repr(url_contains) if url_contains else "None",
+        repr(status_codes_list) if status_codes_list else "None",
+        repr([m.upper() for m in methods_list]) if methods_list else "None",
+        repr(block_patterns_list) if block_patterns_list else "None",
+        repr(exclude_list) if exclude_list else "None",
+        repr([h.lower() for h in sensitive_headers_list]),
+        repr(max_body_length),
+        repr(log_file) if log_file else "None",
+        repr(output_format),
+        repr(no_ssl),
+        json.dumps([r.__dict__ for r in rules_list]) if rules_list else "None",
+        repr(interception_mode),
+        repr(target_list)
     )
+
 
     # Write temporary script file
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
@@ -365,29 +489,31 @@ def intercept(
     try:
         if not quiet:
             print_info("Starting proxy interceptor... Press Ctrl+C to stop.")
-            print_info(f"Configure your client to use proxy: http://localhost:8080")
+            print_info(f"Configure your client to use proxy: http://localhost:{port}")
             if output_format == "har":
                 print_info(f"HAR output will be saved to: {log_file or 'stdout'}")
 
-        # Run mitmdump subprocess with enhanced arguments
-        cmd = ["mitmdump","-p", str(port), "-s", script_path, *cert_args]
+        # Run mitmdump subprocess
+        cmd = ["mitmdump", "-p", str(port), "-s", script_path, *cert_args]
         if quiet:
             cmd.append("-q")
-        subprocess.run(cmd,check=True)
+        subprocess.run(cmd, check=True)
     except KeyboardInterrupt:
         if not quiet:
             print_info("\nProxy interceptor stopped by user.")
     finally:
         try:
-            if not quiet:
-                print_info("Cleaning up temporary script file...")
-            os.unlink(script_path)
-            if auto_proxy:
+            if os.path.exists(script_path):
+                os.unlink(script_path)
                 if not quiet:
-                    print_info("Restoring original proxy settings...")
+                    print_info("Cleanup complete", log=config.get("log"))
+            if auto_proxy:
                 restore_system_proxy()
+                if not quiet:
+                    print_info("System proxy restored", log=config.get("log"))
         except Exception as e:
-            print_warning(f"Failed to clean up temporary files: {e}", show_traceback=config.get("debug"))
+            if not quiet:
+                print_warning(f"Cleanup warning: {e}", log=config.get("log"))
 
     
 
@@ -399,7 +525,7 @@ def bruteforce_dirs(
     headers: str = typer.Option(None, '-H', '--headers', help='Optional headers'),
     robots: bool = typer.Option(True,"--respect-robots",help = "Respects the robot.txt of the site"),
     mode: str = typer.Option("normal", "--mode", help="Scan mode: normal | safe | smart"),
-    output: str = typer.Option(None, '-o', help="Output filename for results")
+    output: str = typer.Option(None, '--output', '-o', help="Output filename for results")
 ):
     """Run HTTP directory brute-force against a target."""
 
@@ -447,10 +573,17 @@ def bruteforce_dirs(
 
     # --- SMART MODE LOGIC ---
     if mode == "smart":
+        max_workers = min(3, max_workers)
+        min_delay = max(2, min_delay)
+        max_delay = max(4, max_delay)
+
         auto_tune_rate_limits(validated_url)
 
         print_info("[smart-dirscan] Crawling target for path hints...")
-        prefixes = extract_path_prefixes_from_html(validated_url)
+        prefixes = extract_path_prefixes_from_html(validated_url,headers=prepare_headers(),
+                                                   throttle=config["source_delay"],timeout=config["timeout"],
+                                                   verify_ssl=config["verify_ssl"],allow_redirects=True,
+                                                   log=config["log"],retries=3)
         if prefixes:
             print_info(f"[smart-dirscan] Found {len(prefixes)} prefixes: {prefixes}")
             with open(word_list) as f:
@@ -489,22 +622,24 @@ Metric Scanning
 """
 @app.command('metric', help="Scans for metric/debug endpoints on a target.")
 def metricprobe(
-    url: str = typer.Option(None, '-u', '--url', help="Target base URL"),
+    url: str = typer.Option(None, '-u', '--url'),
     list: str = typer.Option(None, help="Path to file with list of target URLs"),
-    output: str = typer.Option(None, '-o', help="Output filename for results"),
-    scan_mode: str = typer.Option("normal", "--scan-mode", help="Scan mode: normal | safe | smart")
+    output: str = typer.Option(None, '--output', '-o'),
+    scan_mode: str = typer.Option("normal", "--scan-mode"),
+    headers: str = typer.Option(None, '-H', '--headers'),
+    timeout: int = typer.Option(None, '-t', '--timeout')
 ):
-    """
-    Scan for exposed metric/debug endpoints.
-    """
+    
+    headers = prepare_headers(headers) if headers else prepare_headers()
 
     # Apply mode-based throttling and config overrides
     max_threads = config["workers"]
     throttle = config["source_delay"]
-    timeout = config["timeout"]
+    timeout = timeout if timeout is not None else config['timeout']
     allow_redirects = True
 
     if scan_mode == "safe":
+        
         max_threads = min(3, config["workers"])
         throttle = max(2, throttle)
         allow_redirects = False
@@ -524,7 +659,6 @@ def metricprobe(
                 print_error(f"[smart-mode] Could not auto-tune due to error: {e}")
                 raise typer.Exit(code=1)
 
-    headers = prepare_headers()
 
     try:
         if url:
@@ -533,7 +667,7 @@ def metricprobe(
                 print_error(f"Invalid URL: {url}")
                 raise typer.Exit(code=1)
 
-            results = metricprobe.scan_target(
+            results = scan_target(
                 url,
                 max_threads=max_threads,
                 headers=headers,
@@ -543,7 +677,7 @@ def metricprobe(
                 allow_redirects=allow_redirects
             )
 
-            if output and results:
+            if output:
                 save_to_file(output, results)
 
         elif list:
@@ -551,7 +685,7 @@ def metricprobe(
             with open(filepath, 'r') as f:
                 targets = [line.strip() for line in f if line.strip()]
 
-            results = metricprobe.batch_metric_probe(
+            results = batch_metric_probe(
                 targets,
                 max_threads=max_threads,
                 headers=headers,
@@ -573,7 +707,6 @@ def metricprobe(
         raise typer.Exit(code=1)
 
 
-
 def load_disallowed_subs(path: str) -> set:
     try:
         with open(path) as f:
@@ -589,14 +722,15 @@ def is_disallowed(sub: str, disallowed: set) -> bool:
 
 @app.command("subenum", help="Finds subdomains for a given domain using multiple sources.")
 def find_subdomains(
-    domain: str = typer.Argument(..., help="Target domain (e.g. example.com)"),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="Enable recursive subdomain search"),
-    max_depth: int = typer.Option(1, "--depth", "-d", help="Max recursion depth"),
-    headers: str = typer.Option(None, '-H', '--headers', help='Optional headers'),
-    disallowed_subs: Optional[str] = typer.Option(None, "--disallowed-subs", help="File with subdomains to exclude"),
-    output: str = typer.Option(None, '-o', help="Output filename for results"),
-    scan_mode: str = typer.Option("normal", "--scan-mode", help="Scan mode: normal | safe | smart")
+    domain: str = typer.Argument(...),
+    recursive: bool = typer.Option(False, "--recursive", "-r"),
+    max_depth: int = typer.Option(1, "--depth", "-d"),
+    headers: str = typer.Option(None, '-H', '--headers'),
+    disallowed_subs: Optional[str] = typer.Option(None, "--disallowed-subs"),
+    output: str = typer.Option(None, '--output', '-o'),
+    scan_mode: str = typer.Option("normal", "--scan-mode"),
 ):
+    
     """
     Find subdomains for a domain using multiple online sources.
     """
@@ -612,8 +746,7 @@ def find_subdomains(
     verify_ssl = config["verify_ssl"]
     file_format = config["file_format"]
 
-    if output: 
-        save_file = True
+    save_file = output is not None
 
     if scan_mode == "safe":
         print_info("[safe-mode] Applying stealth constraints...")
@@ -670,7 +803,7 @@ def find_from_file(
     disallowed_subs: Optional[str] = typer.Option(None, "--disallowed-subs", help="File with subdomains to exclude"),
     scan_mode: str = typer.Option("normal", "--scan-mode", help="Scan mode: normal | safe | smart")
 ):
-
+    
     try:
         file = validate_input_file(file)
     except Exception as e:
@@ -701,13 +834,15 @@ def find_from_file(
         print_info("[smart-mode] Auto-tuning delays based on RTT from first domain...", log=config.get("log"))
         auto_tune_rate_limits(f"https://{domains[0]}")  # Uses first domain for RTT
 
+    save_file = output is not None
+
     results = subdomain_from_file(
         filename=file,
         max_workers=max_workers,
         headers=prepare_headers(headers),
         recursive=recursive,
         max_depth=max_depth,
-        save_file=config['save_file'],
+        save_file=save_file,
         file_format=config['file_format'],
         rmin_throttle=min_delay,
         rmax_throttle=max_delay,
@@ -762,17 +897,17 @@ def create_custom_wordlist(
 
     
     # Set default output filename if saving
-    if output:
-        save_file = True
-    else:
-        save_file = False
+    save_file = output is not None
 
     headers_dict = prepare_headers(headers)
 
     # Smart content-mode: inject extracted content into wordlist
     if scan_mode == "smart" and mode == "content":
         print_info("[smart-wordlist] Crawling target to extract path segments for enrichment...")
-        prefixes = extract_path_prefixes_from_html(domain)
+        prefixes = extract_path_prefixes_from_html(domain,headers=prepare_headers(),
+                                                   throttle=config["source_delay"],timeout=config["timeout"],
+                                                   verify_ssl=config["verify_ssl"],allow_redirects=True,
+                                                   log=config["log"],retries=3)
         if prefixes:
             print_info(f"[smart-wordlist] Found {len(prefixes)} content path segments: {prefixes}", log=config["log"])
             with NamedTemporaryFile(delete=False, mode="w", suffix=".txt") as f:
