@@ -184,7 +184,6 @@ def import_cves_from_json(json_path: str, db_path: str = "cves.db", show_traceba
             ON CONFLICT(filepath) DO UPDATE SET filehash=excluded.filehash, imported_at=CURRENT_TIMESTAMP
         ''', (json_path, current_hash))
         conn.commit()
-        print_success(f"Finished importing {count} CVE entries from {json_path}.")
         return f"Successfully imported {count} CVEs from '{json_path}'."
 
     except Exception as e:

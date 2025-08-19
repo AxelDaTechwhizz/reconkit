@@ -8,12 +8,12 @@ def load_requirements(path):
 
 setup(
     name="reconkit",
-    version="1.0.0",
+    version="2.1.0",
     author="NyxSynn",
     description="Modular recon tool for web enumeration, tech detection, and CVE scanning",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/AxelDaTechwhizz/ReconKit",
+    url="https://github.com/AxelDaTechwhizz/reconKit",
     packages=find_packages(),
     include_package_data=True,
     install_requires=load_requirements("requirements-base.txt"),

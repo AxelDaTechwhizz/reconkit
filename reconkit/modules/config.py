@@ -21,7 +21,6 @@ DEFAULTS = {
     "save_file": False,
     "debug": False,
     "log": False,
-    "safe_mode": True,
     "profile": None 
 }
 
@@ -45,7 +44,6 @@ def save_user_config(data, path=DEFAULT_CONFIG_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump({k: v for k, v in data.items() if k in DEFAULTS}, f, indent=2)
-
 
 
 """

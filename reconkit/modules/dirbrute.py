@@ -5,8 +5,32 @@ from time import sleep
 from typing import List
 import reconkit.modules.utils
 from bs4 import BeautifulSoup
-import sys
-import os
+import sys, os, re
+
+
+JS_PATTERNS = {
+    "urls": re.compile(r"https?:\/\/[a-zA-Z0-9\.\-_/]+"),
+    "endpoints": re.compile(r"\/[a-zA-Z0-9_\-\/\.]{3,}"),
+    "jwt": re.compile(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"),
+    "bearer": re.compile(r"Bearer\s+[A-Za-z0-9\-_\.]+"),
+    "api_keys": re.compile(
+        r"['\"]?(api[_-]?key|apikey|auth|token|secret|password)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-]{16,})['\"]",
+        re.IGNORECASE,
+    ),
+    "aws_key": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "aws_secret": re.compile(
+        r"(?i)aws_secret_access_key['\"]?\s*[:=]\s*['\"]([A-Za-z0-9\/+=]{40})"
+    ),
+}
+
+def extract_from_js(js_text: str, source: str) -> dict:
+    findings = {}
+    for key, pattern in JS_PATTERNS.items():
+        matches = list(set(pattern.findall(js_text)))
+        if matches:
+            findings[key] = matches
+    return findings if findings else None
+
 
 def extract_path_prefixes_from_html(base_url: str,headers: dict,throttle: float,timeout: int, 
                                     verify_ssl: bool,allow_redirects: bool,log: bool,retries: int) -> List[str]:
@@ -47,32 +71,33 @@ def http_dir_bruteforcer(word_list: str, url: str, timeout: int, throttle: float
                          filename: str = None) -> dict:
     
     found_dirs = []
+    js_results = {}
     success_codes: List[int] = [200, 301, 302, 403]
 
 
     url = reconkit.modules.utils.validate_url(url)
     if not url:
-        return found_dirs
+        return {"target": url, "found": [], "js_results": {}}
 
     try:
         word_list = reconkit.modules.utils.validate_input_file(word_list)
     except Exception as e:
         reconkit.modules.utils.print_error(f"Recieved error as {e}")
-        return found_dirs
+        return {"target": url, "found": [], "js_results": {}}
 
     try:
         with open(os.path.abspath(word_list), 'r', encoding='utf-8') as file:
             words = [line.strip() for line in file if line.strip()]
     except FileNotFoundError:
         reconkit.modules.utils.print_error(f"Word list file not found: {word_list}")
-        return found_dirs
+        return {"target": url, "found": [], "js_results": {}}
     except Exception as e:
         reconkit.modules.utils.print_error(f"An error occurred while reading word list: {str(e)}")
-        return found_dirs
+        return {"target": url, "found": [], "js_results": {}}
 
     if not words:
         reconkit.modules.utils.print_error("Word list is empty.")
-        return found_dirs
+        return {"target": url, "found": [], "js_results": {}}
 
 
     def check_directory(word):
@@ -80,16 +105,41 @@ def http_dir_bruteforcer(word_list: str, url: str, timeout: int, throttle: float
         base_url = url.rstrip('/') + '/'
         normalized_word = word.strip().strip('/')
         full_url = urljoin(base_url, normalized_word)
-        response = reconkit.modules.utils.fetch_with_retry(full_url,allow_redirects=allow_redirecs,
-                                                           throttle=throttle, headers=headers, timeout=timeout, 
-                                                           verify_ssl=verify_ssl)
+
+        response = reconkit.modules.utils.fetch_with_retry(
+            full_url,
+            allow_redirects=False,
+            throttle=throttle,
+            headers=headers,
+            timeout=timeout,
+            verify_ssl=verify_ssl
+        )
         reconkit.modules.utils.random_throttle(rmin_throttle, rmax_throttle)
 
-        if response and response.status_code in success_codes:
-            return full_url
-        else:
-            reconkit.modules.utils.print_info(f"Checked: {full_url} - Status: {response.status_code if response else 'No Response'}")
+        if not response:
+            reconkit.modules.utils.print_info(f"Checked: {full_url} - No Response")
             return None
+        
+        if response.status_code == 200:
+            if len(response.text) > 50:  # avoid empty/default responses
+                # scrape .js if found
+                if full_url.endswith(".js"):
+                    findings = extract_from_js(response.text)
+                    if findings:
+                        js_results[full_url] = findings
+                        reconkit.modules.utils.print_status(
+                            f"Extracted {len(findings)} findings from {full_url}", "info"
+                        )
+                return full_url
+        elif response.status_code in [301, 302]:
+            location = response.headers.get("Location", "")
+            if not location.endswith("/") and location != url:
+                return full_url
+        elif response.status_code == 403:
+            return full_url 
+
+        reconkit.modules.utils.print_info(f"Checked: {full_url} - Status: {response.status_code}")
+        return None
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(check_directory, word) for word in words]
@@ -121,5 +171,6 @@ def http_dir_bruteforcer(word_list: str, url: str, timeout: int, throttle: float
         "target": url,
         "found": found_dirs,
         "total_attempts": len(words),
-        "success_count": len(found_dirs)
+        "success_count": len(found_dirs),
+        "js_results": js_results,
     }

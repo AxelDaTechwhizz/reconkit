@@ -404,12 +404,16 @@ import ipaddress
 def is_valid_domain(domain: str) -> bool:
     """
     Validates if the input is a proper domain name (not an IP address),
-    and explicitly allows 'localhost' for local testing.
+    and explicitly allows 'localhost' for local testing (any port).
     """
     if not domain or not isinstance(domain, str):
         return False
 
     domain = domain.strip().lower()
+
+    # If domain includes a port, split it
+    if ":" in domain:
+        domain, _ = domain.split(":", 1)
 
     # Explicitly allow localhost
     if domain == "localhost":
@@ -438,6 +442,7 @@ def is_valid_domain(domain: str) -> bool:
     domain_regex = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
 
     return all(domain_regex.match(label) for label in labels)
+
 
 
 def list_files_in_folder(folder_path, ext=".json"):

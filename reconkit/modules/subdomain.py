@@ -174,7 +174,7 @@ def subdomain_finder(domain: str, max_workers: int,timeout: int, verify_ssl: boo
 
 
 def subdomain_from_file(filename: str, max_workers: int, save_file: bool,
-                        headers : dict, rmin_throttle : float,recursive: bool , max_depth: int,
+                        headers : dict,throttle : float, rmin_throttle : float,recursive: bool , max_depth: int,
                         rmax_throttle : float,output : str,
                         file_format: str = 'txt') -> Dict[str, List[str]]:
     """
@@ -200,7 +200,7 @@ def subdomain_from_file(filename: str, max_workers: int, save_file: bool,
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(subdomain_finder,domain, max_workers,headers, save_file,
+            executor.submit(subdomain_finder,domain, max_workers,headers,throttle, save_file,
                              file_format,recursive, max_depth): domain
             for domain in domains
         }

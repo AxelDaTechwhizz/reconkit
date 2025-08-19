@@ -23,35 +23,57 @@ from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any
 
 
-def get_headers_cookies(url: str, timeout: int,throttle : float,headers : dict,
-                        verify_ssl: bool, allow_redirects: bool = True ):
+def get_headers_cookies(url: str, timeout: int, throttle: float, headers: dict,
+                        verify_ssl: bool, allow_redirects: bool = True):
+    """
+    Fetches headers and cookies from the given URL safely.
+    """
 
-      
-      """
-      Fetches headers and cookies from the given URL.
-      """
-      
-      try:
-            response = reconkit.modules.utils.fetch_with_retry(url,timeout=timeout,throttle=throttle,headers=headers,allow_redirects=allow_redirects,
-                                              verify_ssl=verify_ssl)
+    try:
 
-            if not response or not response.ok:
-                  reconkit.modules.utils.print_error(f"Bad response from {url}: {response.status_code if response else 'No Response'}")
-                  return None, None
+        timeout = timeout if timeout is not None else 10     # fallback if None
+        throttle_delay = float(throttle) if throttle is not None else 2.0
 
-            # Extract headers and cookies
-            headers = response.headers
-            cookies = response.cookies.get_dict()
-            if not headers:
-                  reconkit.modules.utils.print_info(f"No headers found in {url}.")
-            if not cookies:
-                  reconkit.modules.utils.print_info(f"No cookies found in {url}.")
-            if not headers and not cookies:
-                  reconkit.modules.utils.print_info(f"No headers and cookies found in {url}.")
-            return headers, cookies,response.text
-      except Exception as e:
-            reconkit.modules.utils.print_error(f"Error fetching headers and cookies: {e}")
-            return None, None,None
+
+        response = reconkit.modules.utils.fetch_with_retry(
+            url,
+            timeout=timeout,
+            throttle=throttle_delay,
+            headers=headers,
+            allow_redirects=allow_redirects,
+            verify_ssl=verify_ssl
+        )
+
+        # Ensure response is valid
+        if not response:
+            reconkit.modules.utils.print_error(f"No response returned from {url}.")
+            return {}, {}, ""
+
+        # Ensure .ok exists and is True
+        if not getattr(response, "ok", False):
+            status = getattr(response, "status_code", "N/A")
+            reconkit.modules.utils.print_error(f"Bad response from {url}: {status}")
+            return {}, {}, ""
+
+        # Safely extract headers, cookies, and text
+        safe_headers = dict(getattr(response, "headers", {}) or {})
+        safe_cookies = getattr(getattr(response, "cookies", {}), "get_dict", lambda: {})() or {}
+        safe_text = getattr(response, "text", "") or ""
+
+        if not safe_headers:
+            reconkit.modules.utils.print_info(f"No headers found in {url}.")
+        if not safe_cookies:
+            reconkit.modules.utils.print_info(f"No cookies found in {url}.")
+        if not safe_headers and not safe_cookies:
+            reconkit.modules.utils.print_info(f"No headers and cookies found in {url}.")
+
+        return safe_headers, safe_cookies, safe_text
+
+    except Exception as e:
+        reconkit.modules.utils.print_error(f"Error fetching headers and cookies: {e}")
+        return {}, {}, ""
+
+
 
 
 def get_ssl_info(url: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
